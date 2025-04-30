@@ -1,0 +1,218 @@
+<?php
+require_once($_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_admin_before.php');
+
+use Bitrix\Main\Localization\Loc;
+use Bitrix\Main\Application;
+use Bitrix\Main\Loader;
+use Bitrix\Main\Web\Uri;
+use Bitrix\Sale\Order;
+
+Loc::loadMessages(__FILE__);
+
+Loader::includeModule('mozaika.delivery');
+
+// Select data
+$errors = [];
+$context = Application::getInstance()->getContext();
+$request = $context->getRequest();
+$server = $context->getServer();
+$order = Order::load((int)$request->getQuery('ID'));
+$deliveryId = $order->getDeliveryIdList()[0] ?? 0;
+$props = $order->getPropertyCollection();
+$propByCode = [
+    '@ADDRESS' => $props->getAddress(),
+];
+foreach ($props->getArray()['properties'] as $prop) {
+    $propByCode[strtoupper($prop['CODE'])] = $props->getItemByOrderPropertyId($prop['ID']);
+}
+$currentPointId = empty($propByCode['PICKPOINT_ID']) ? 0 : $propByCode['PICKPOINT_ID']->getValue();
+$uri = new Uri($server->getRequestUri());
+$uri->setPath('/bitrix/admin/sale_order_view.php');
+
+// Fast calc delivery price
+$basketPrice = $order->getBasket()->getPrice();
+$weight = $order->getBasket()->getWeight() / 1000 + (float)Mozaika\DevEnv\ModuleOption::get('default_pack_weight', '0.4', 'mozaika.delivery');
+$zones = [];
+$list = Mozaika\Delivery\Models\ZoneTable::getList(['select' => ['ID', 'RATES']]);
+while ($zone = $list->fetch()) {
+    $zone['RATE'] = 0;
+    foreach ($zone['RATES'] as $step => $price) {
+        if ($weight > $step) {
+            $zone['RATE'] = $price;
+        }
+    }
+    $zones[$zone['ID']] = $zone['RATE'] + $basketPrice * 0.005; //0.5% от стоимости заказа
+}
+$ppoints = array_map(function ($point) use ($zones) {
+    $point['PRICE'] = round($zones[$point['RATE_ZONE']] ?? 0);
+    return $point;
+}, \Mozaika\Delivery\Controller\Pickpoints::loadAllAction());
+
+// Save data
+$savePointId = (int)($request->getPost('PICKPOINT_ID') ?? 0);
+if ($request->isPost() && check_bitrix_sessid()) {
+    $point = $ppoints[$savePointId] ?? [];
+    switch ($point['SERVICE_CODE']) {
+        case 'fivepost':
+            if (!empty($propByCode['PICKPOINT_DATA'])) {
+                $propByCode['PICKPOINT_DATA']->setValue($point['SERVICE_ID']);
+            }
+            if (!empty($propByCode['@ADDRESS'])) {
+                $propByCode['@ADDRESS']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['NAME']})");
+            }
+            if (!empty($propByCode['ADDRESS_BOXBERRY'])) {
+                $propByCode['ADDRESS_BOXBERRY']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['NAME']})");
+            }
+            break;
+        case 'boxberry':
+            if (!empty($propByCode['PICKPOINT_DATA'])) {
+                $propByCode['PICKPOINT_DATA']->setValue($point['NAME']);
+            }
+            if (!empty($propByCode['@ADDRESS'])) {
+                $propByCode['@ADDRESS']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['SERVICE_ID']})");
+            }
+            if (!empty($propByCode['ADDRESS_BOXBERRY'])) {
+                $propByCode['ADDRESS_BOXBERRY']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['SERVICE_ID']})");
+            }
+            break;
+        case 'yandex':
+        case 'ruspost':
+        case 'ozon':
+            if (!empty($propByCode['PICKPOINT_DATA'])) {
+                $propByCode['PICKPOINT_DATA']->setValue($point['SERVICE_ID']);
+            }
+            if (!empty($propByCode['@ADDRESS'])) {
+                $propByCode['@ADDRESS']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['SERVICE_ID']})");
+            }
+            if (!empty($propByCode['ADDRESS_BOXBERRY'])) {
+                $propByCode['ADDRESS_BOXBERRY']->setValue("{$point['LOC_ADDRESS']} (ПВЗ {$point['SERVICE_NAME']} №{$point['SERVICE_ID']})");
+            }
+            break;
+    }
+    if (!empty($propByCode['PICKPOINT_ID'])) {
+        $propByCode['PICKPOINT_ID']->setValue($savePointId);
+        $propByCode['PICKPOINT_ID']->save();
+    }
+    foreach (['PICKPOINT_DATA', 'address_boxberry', '@ADDRESS'] as $code) {
+        if (!empty($propByCode[$code])) {
+            $propByCode[$code]->save();
+        }
+    }
+    LocalRedirect($uri->getUri());
+    exit;
+}
+
+// Show layout
+$GLOBALS['APPLICATION']->SetTitle(Loc::getMessage('ADMIN_CHANGE_ORDER_PPOINT_TITLE', ['#ORDER_ID#' => $order->getId()]));
+require_once($_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_admin_after.php');
+
+// Menu
+$menu = new CAdminContextMenu([
+    [
+        'TEXT' => Loc::getMessage('ADMIN_CHANGE_ORDER_MENU_TEXT_BACK'),
+        'TITLE' => Loc::getMessage('ADMIN_CHANGE_ORDER_MENU_TITLE_BACK'),
+        'LINK' => $uri->getUri(),
+        'ICON' => 'btn_list',
+    ],
+    [
+        'TEXT' => Loc::getMessage('ADMIN_CHANGE_ORDER_MENU_TEXT_SAVE'),
+        'TITLE' => Loc::getMessage('ADMIN_CHANGE_ORDER_MENU_TITLE_SAVE'),
+        'LINK' => 'javascript:sendSaveForm();',
+        'ICON' => 'btn_green',
+    ],
+]);
+$menu->Show();
+?>
+
+<script src="https://api-maps.yandex.ru/2.1/?lang=ru_RU&apikey=<?=\Mozaika\DevEnv\EnvOption::get('yamap_key')?>" defer></script>
+<form method="post" action="" method="post" id="mainEditForm">
+    <?=bitrix_sessid_post()?>
+    <input type="hidden" name="PICKPOINT_ID" value="<?=$currentPointId?>" id="ppointId">
+</form>
+<div id="ppoints-map" style="height: 50vh"></div>
+<script>
+    var ppoints = <?=json_encode($ppoints, JSON_UNESCAPED_UNICODE)?>, waiter, ppointsMap, ppointId, currentMarker;
+    waiter = setInterval(function(){
+        if (typeof ymaps !== 'undefined') {
+            clearInterval(waiter);
+            ymaps.ready(function(){
+                var center = [55.755814, 37.617635], cluster;
+                ppointId = document.getElementById('ppointId').value;
+                for (var i in ppoints) {
+                    if (!ppoints.hasOwnProperty(i)) continue;
+                    if (ppoints[i].ID == ppointId) {
+                        center = [ppoints[i].LOC_LAT, ppoints[i].LOC_LNG];
+                    }
+                }
+                ppointsMap = new ymaps.Map('ppoints-map', {
+                    center: center,
+                    zoom: 14,
+                    controls: ['zoomControl', 'typeSelector', 'geolocationControl', 'trafficControl', 'rulerControl', 'searchControl']
+                });
+                cluster = new ymaps.Clusterer({
+                    preset: 'islands#redClusterIcons'
+                });
+                for (var i in ppoints) {
+                    if (!ppoints.hasOwnProperty(i)) continue;
+                    var point = ppoints[i], marker, desc = [];
+                    if (point.NAME) {
+                        desc.push('<b>Название:</b> ' + point.NAME);
+                    }
+                    if (point.SERVICE_ID) {
+                        desc.push('<b>ID:</b> ' + point.SERVICE_ID);
+                    }
+                    if (point.LOC_ADDRESS) {
+                        desc.push('<b>Адрес:</b> ' + point.LOC_ADDRESS);
+                    }
+                    if (point.WORK_TIME) {
+                        desc.push('<b>Время работы:</b> ' + point.WORK_TIME);
+                    }
+                    if (point.CONTACT_PHONES[0]) {
+                        desc.push('<b>Телефон:</b> ' + point.CONTACT_PHONES[0]);
+                    }
+                    desc.push('<b>Оплата:</b> ' + (point.CAN_CASH == 'Y' || point.CAN_CARD == 'Y' ? 'возможна оплата при получении' : 'только предоплата'));
+                    if (point.PRICE) {
+                        desc.push('<b>Стоимость доставки:</b> <span style="font-size: 150%; color: red; font-weight: bold;">' + point.PRICE + ' </span> руб.');
+                    }
+                    marker = new ymaps.Placemark(
+                        [point.LOC_LAT, point.LOC_LNG],
+                        {
+                            pointId: point.ID,
+                            balloonContentHeader: 'Пункт выдачи ' + point.SERVICE_NAME,
+                            balloonContentBody: desc.join('<br>'),
+                            balloonContentFooter: '',
+                            hintContent: 'Пункт выдачи ' + point.SERVICE_NAME
+                        },
+                        {
+                            iconLayout: 'default#image',
+                            iconImageHref: point.MAP_MARKER,
+                            iconImageSize: [28, 42],
+                            iconImageOffset: [-14, -40]
+                        }
+                    );
+                    marker.events.add('click', function(e){
+                        document.getElementById('ppointId').value = e.get('target').properties.get('pointId');
+                    });
+                    cluster.add(marker);
+                    if (ppointId == point.ID) {
+                        currentMarker = marker;
+                    }
+                }
+                ppointsMap.geoObjects.add(cluster);
+                var state = cluster.getObjectState(currentMarker);
+                if (state.isClustered) {
+                    state.cluster.state.set('activeObject', currentMarker);
+                    cluster.balloon.open(state.cluster);
+                } else if (state.isShown) {
+                    currentMarker.balloon.open();
+                }
+            });
+        }
+    }, 500);
+    function sendSaveForm () {
+        document.getElementById('mainEditForm').submit();
+    }
+</script>
+<?
+$menu->Show();
+require($_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/epilog_admin.php');
